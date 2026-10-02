@@ -862,6 +862,54 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
     throw new Error('Food safety review can only be submitted when status is out_for_pickup');
   }
 
+  // ── Fetch actual ESP32 food quality score belonging to this donation ──────
+  const FoodTest = require('../models/FoodTest');
+  let latestTest = await FoodTest.findOne(
+    { donationId: donation._id, status: 'completed', foodQualityScore: { $ne: null } },
+    null,
+    { sort: { completedAt: -1 } }
+  );
+
+  // If no completed test found, check if an active test has readings and complete it
+  if (!latestTest) {
+    const activeTest = await FoodTest.findOne(
+      { donationId: donation._id, status: 'active' },
+      null,
+      { sort: { startedAt: -1 } }
+    );
+    if (activeTest && activeTest.readings && activeTest.readings.length > 0) {
+      const { calculateFoodQualityScore } = require('../utils/foodQualityScorer');
+      const scoreResult = calculateFoodQualityScore(activeTest.readings);
+      activeTest.status = 'completed';
+      activeTest.completedAt = new Date();
+      activeTest.foodQualityScore = scoreResult ? scoreResult.foodQualityScore : null;
+      await activeTest.save();
+      latestTest = activeTest;
+    }
+  }
+
+  if (!latestTest || latestTest.foodQualityScore == null) {
+    res.status(400);
+    throw new Error('Food Health Score is not available for this donation. ESP32 test must be completed first.');
+  }
+
+  const actualScore = latestTest.foodQualityScore;
+  const isScoreSafe = actualScore >= 50;
+
+  // ── Backend Review Validation ─────────────────────────────────────────────
+  // Exactly >= 50% is SAFE, < 50% is UNSAFE
+  if (isSafe !== isScoreSafe) {
+    res.status(400);
+    throw new Error('Review does not match the ESP32 food health analysis.');
+  }
+
+  // ── Save review result and actual ESP32 health score ──────────────────────
+  donation.foodSafetyReview = {
+    review: isSafe ? 'SAFE' : 'UNSAFE',
+    healthScore: actualScore,
+    reviewedAt: new Date(),
+  };
+
   const { sendEmail, sendSMS } = require('../utils/notify');
 
   // ── Fetch NGO profile separately to get officeLocation for ETA ──────────
@@ -877,7 +925,6 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
         if (coords && (coords[0] !== 0 || coords[1] !== 0)) {
           ngoOfficeCoords = coords;
         }
-        // Prefer User's phone (already in acceptedBy.phone), NGO doc doesn't store phone separately
       }
     }
   } catch (ngoErr) {
@@ -889,7 +936,7 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
     donation.status = 'picked_up';
     donation.timeline.push({
       status: 'picked_up',
-      note: 'Volunteer confirmed food is safe at pickup. En route to NGO.',
+      note: `Volunteer confirmed food is safe (ESP32 Health Score: ${actualScore}%). En route to NGO.`,
       updatedBy: req.user._id,
       timestamp: new Date(),
     });
@@ -915,26 +962,6 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
       console.warn('[foodSafetyReview] ETA fetch failed:', etaErr.message);
     }
 
-    // ── Look up ESP32 food quality score (non-fatal; backward compatible) ─
-    // If a FoodTest was completed for this donation, append the score to
-    // the SMS.  If none exists, scoreText stays '' and the SMS is unchanged.
-    let scoreText = '';
-    try {
-      const FoodTest = require('../models/FoodTest');
-      const latestTest = await FoodTest.findOne(
-        { donationId: donation._id, status: 'completed', foodQualityScore: { $ne: null } },
-        null,
-        { sort: { completedAt: -1 } }
-      );
-      if (latestTest && latestTest.foodQualityScore != null) {
-        scoreText = ` Food Quality Score: ${latestTest.foodQualityScore}%.`;
-        console.log(`[foodSafetyReview] Appending food quality score ${latestTest.foodQualityScore}% to SMS (test: ${latestTest.testId})`);
-      }
-    } catch (scoreErr) {
-      // Score lookup failure must NEVER block the food-review notification
-      console.warn('[foodSafetyReview] Score lookup failed (non-fatal):', scoreErr.message);
-    }
-
     // ── Notify NGO via email + SMS ────────────────────────────────────────
     const ngo = donation.acceptedBy;
     if (ngo) {
@@ -947,13 +974,14 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
         ``,
         `📦 Food: ${donation.foodName}`,
         `🚴 Volunteer: ${req.user.name}`,
+        `🛡️ Food Safety Review: SAFE`,
+        `📊 Food Health Score: ${actualScore}%`,
         `⏱️ Estimated Arrival: ${etaText}`,
-        scoreText ? `📊 Food Quality Score: ${scoreText.trim()}` : '',
         ``,
         `Please be ready to receive the delivery at your NGO.`,
         ``,
         `— GiveAway Platform`,
-      ].filter(l => l !== '').join('\n');
+      ].join('\n');
 
       const htmlBody = `
         <div style="font-family:sans-serif;max-width:500px;margin:0 auto">
@@ -961,23 +989,22 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
             <h2 style="color:#fff;margin:0">✅ Food is Safe — Volunteer En Route!</h2>
           </div>
           <div style="border:1px solid #d1fae5;border-top:none;padding:24px;border-radius:0 0 12px 12px;background:#f0fdf4">
-            <p style="margin:0 0 12px">Volunteer <strong>${req.user.name}</strong> has inspected and confirmed the food donation is <strong style="color:#16a34a">SAFE</strong>.</p>
+            <p style="margin:0 0 12px">Volunteer <strong>${req.user.name}</strong> has inspected and confirmed the food donation is <strong style="color:#16a34a">SAFE</strong> based on ESP32 food health analysis.</p>
             <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
               <tr><td style="padding:6px 0;color:#6b7280">📦 Food:</td><td style="padding:6px 0;font-weight:600">${donation.foodName}</td></tr>
               <tr><td style="padding:6px 0;color:#6b7280">🚴 Volunteer:</td><td style="padding:6px 0;font-weight:600">${req.user.name}</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280">🛡️ Safety Review:</td><td style="padding:6px 0;font-weight:600;color:#16a34a">SAFE</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280">📊 Food Health Score:</td><td style="padding:6px 0;font-weight:600;color:#2563eb">${actualScore}%</td></tr>
               <tr><td style="padding:6px 0;color:#6b7280">⏱️ ETA:</td><td style="padding:6px 0;font-weight:600;color:#16a34a">${etaText}</td></tr>
-              ${scoreText ? `<tr><td style="padding:6px 0;color:#6b7280">📊 Quality Score:</td><td style="padding:6px 0;font-weight:600;color:#2563eb">${scoreText.trim()}</td></tr>` : ''}
             </table>
             <p style="margin:0;color:#374151">Please be ready to receive the delivery at your NGO.</p>
-            ${scoreText ? `<p style="margin:8px 0 0;font-size:11px;color:#9ca3af">Food Quality Score is a prototype sensor indicator only and is not a certified food-safety assessment.</p>` : ''}
           </div>
           <p style="color:#9ca3af;font-size:12px;text-align:center;margin-top:12px">— GiveAway Platform</p>
         </div>`;
 
-      // SMS: appends score if available — otherwise identical to the original SMS
-      const smsMessage = `GiveAway ✅ FOOD SAFE! Volunteer ${req.user.name} confirmed "${donation.foodName}" is safe & is on the way to your NGO. ETA: ${etaText}. Please be ready!${scoreText}`;
+      const smsMessage = `GiveAway ✅ Food Safety Review: SAFE. Food Health Score: ${actualScore}%. Volunteer ${req.user.name} confirmed "${donation.foodName}" is safe & is on the way to your NGO. ETA: ${etaText}. Please be ready!`;
 
-      console.log(`[foodSafetyReview] Notifying NGO ${ngo.email} (phone: ${ngoPhone || 'not set'}) — food SAFE${scoreText ? ' (with quality score)' : ''}`);
+      console.log(`[foodSafetyReview] Notifying NGO ${ngo.email} (phone: ${ngoPhone || 'not set'}) — Food Safety Review: SAFE, Food Health Score: ${actualScore}%`);
 
       await Promise.all([
         sendEmail({ to: ngo.email, subject, text: textBody, html: htmlBody }).catch((e) => {
@@ -993,17 +1020,18 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
 
     res.json({
       success: true,
-      message: `✅ Food confirmed safe! NGO has been notified via email${ngoPhone ? ' & SMS' : ''}. ETA: ${etaText}`,
+      message: `✅ Food confirmed safe! NGO has been notified via email${ngoPhone ? ' & SMS' : ''}. Health Score: ${actualScore}%. ETA: ${etaText}`,
       eta: etaText,
+      healthScore: actualScore,
       data: donation,
     });
 
   } else {
-    // ── Food is SPOILED → cancel and notify NGO ───────────────────────────
+    // ── Food is UNSAFE → cancel and notify NGO ───────────────────────────
     donation.status = 'expired';
     donation.timeline.push({
       status: 'expired',
-      note: 'Volunteer found the food spoiled at pickup location. Delivery cancelled.',
+      note: `Volunteer reported food as unsafe (ESP32 Health Score: ${actualScore}%). Delivery cancelled.`,
       updatedBy: req.user._id,
       timestamp: new Date(),
     });
@@ -1013,15 +1041,17 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
     // ── Notify NGO via email + SMS ────────────────────────────────────────
     const ngo = donation.acceptedBy;
     if (ngo) {
-      const subject = '❌ Food Found Spoiled at Pickup — Delivery Cancelled';
+      const subject = '❌ Food Found Unsafe at Pickup — Delivery Cancelled';
       const textBody = [
         `We're sorry to inform you.`,
         ``,
-        `Volunteer ${req.user.name} found the food donation "${donation.foodName}"`,
-        `to be SPOILED upon arrival at the pickup location.`,
+        `Volunteer ${req.user.name} reported that the food donation "${donation.foodName}"`,
+        `is UNSAFE upon arrival at the pickup location.`,
         ``,
         `📦 Food: ${donation.foodName}`,
         `🚴 Volunteer: ${req.user.name}`,
+        `🛡️ Food Safety Review: UNSAFE`,
+        `📊 Food Health Score: ${actualScore}%`,
         `❌ Status: Delivery Cancelled (food safety)`,
         ``,
         `The delivery has been automatically cancelled to protect recipient safety.`,
@@ -1033,13 +1063,15 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
       const htmlBody = `
         <div style="font-family:sans-serif;max-width:500px;margin:0 auto">
           <div style="background:#dc2626;padding:20px 24px;border-radius:12px 12px 0 0">
-            <h2 style="color:#fff;margin:0">❌ Food Found Spoiled — Delivery Cancelled</h2>
+            <h2 style="color:#fff;margin:0">❌ Food Found Unsafe — Delivery Cancelled</h2>
           </div>
           <div style="border:1px solid #fecaca;border-top:none;padding:24px;border-radius:0 0 12px 12px;background:#fff5f5">
-            <p style="margin:0 0 12px">Unfortunately, Volunteer <strong>${req.user.name}</strong> reported that the food was <strong style="color:#dc2626">SPOILED</strong> at the pickup location.</p>
+            <p style="margin:0 0 12px">Unfortunately, Volunteer <strong>${req.user.name}</strong> reported that the food was <strong style="color:#dc2626">UNSAFE</strong> at the pickup location based on ESP32 health analysis.</p>
             <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
               <tr><td style="padding:6px 0;color:#6b7280">📦 Food:</td><td style="padding:6px 0;font-weight:600">${donation.foodName}</td></tr>
               <tr><td style="padding:6px 0;color:#6b7280">🚴 Volunteer:</td><td style="padding:6px 0;font-weight:600">${req.user.name}</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280">🛡️ Safety Review:</td><td style="padding:6px 0;font-weight:600;color:#dc2626">UNSAFE</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280">📊 Food Health Score:</td><td style="padding:6px 0;font-weight:600;color:#dc2626">${actualScore}%</td></tr>
               <tr><td style="padding:6px 0;color:#6b7280">❌ Action:</td><td style="padding:6px 0;font-weight:600;color:#dc2626">Delivery Cancelled</td></tr>
             </table>
             <p style="margin:0;color:#374151">The delivery has been automatically cancelled to protect recipient safety. We sincerely apologize.</p>
@@ -1047,9 +1079,9 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
           <p style="color:#9ca3af;font-size:12px;text-align:center;margin-top:12px">— GiveAway Platform</p>
         </div>`;
 
-      const smsMessage = `GiveAway ❌ FOOD SPOILED. Volunteer ${req.user.name} found "${donation.foodName}" spoiled at pickup. Delivery CANCELLED. Sorry for the inconvenience!`;
+      const smsMessage = `GiveAway ❌ Food Safety Review: UNSAFE. Food Health Score: ${actualScore}%. Volunteer ${req.user.name} reported "${donation.foodName}" is unsafe at pickup location. Delivery CANCELLED.`;
 
-      console.log(`[foodSafetyReview] Notifying NGO ${ngo.email} (phone: ${ngoPhone || 'not set'}) — food SPOILED`);
+      console.log(`[foodSafetyReview] Notifying NGO ${ngo.email} (phone: ${ngoPhone || 'not set'}) — Food Safety Review: UNSAFE, Food Health Score: ${actualScore}%`);
 
       await Promise.all([
         sendEmail({ to: ngo.email, subject, text: textBody, html: htmlBody }).catch((e) => {
@@ -1065,7 +1097,8 @@ const foodSafetyReview = asyncHandler(async (req, res) => {
 
     res.json({
       success: true,
-      message: `❌ Food marked as spoiled. NGO has been notified via email${ngoPhone ? ' & SMS' : ''}. Delivery cancelled.`,
+      message: `❌ Food marked as unsafe. NGO has been notified via email${ngoPhone ? ' & SMS' : ''}. Health Score: ${actualScore}%. Delivery cancelled.`,
+      healthScore: actualScore,
       data: donation,
     });
   }

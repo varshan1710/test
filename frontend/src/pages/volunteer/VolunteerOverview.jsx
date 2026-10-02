@@ -43,6 +43,9 @@ import {
   deleteDonation,
   respondVolunteerInvitation,
   completeVolunteerDelivery,
+  getLatestEspTestForDonation,
+  startEspTest,
+  completeEspTest,
 } from '../../services/donationService';
 
 const POLL_INTERVAL_MS = 10000; // poll nearby donations every 10 seconds
@@ -213,6 +216,70 @@ const VolunteerInvitationCard = ({ donation, onResponse }) => {
 const FoodSafetyReviewCard = ({ donation, onReviewSubmitted }) => {
   const [submitting, setSubmitting] = useState(null); // 'safe' | 'spoiled' | null
   const [confirmed, setConfirmed] = useState(null);   // pre-confirmation step
+  const [espScore, setEspScore] = useState(null);
+  const [testDetails, setTestDetails] = useState(null);
+  const [loadingScore, setLoadingScore] = useState(true);
+  const [actionLoading, setActionLoading] = useState(false);
+
+  const fetchTestScore = useCallback(() => {
+    setLoadingScore(true);
+    getLatestEspTestForDonation(donation._id)
+      .then((res) => {
+        const test = res.data?.data;
+        if (test?.foodQualityScore != null) {
+          setEspScore(test.foodQualityScore);
+          setTestDetails(test);
+        } else if (test) {
+          setEspScore(null);
+          setTestDetails(test);
+        } else {
+          setEspScore(null);
+          setTestDetails(null);
+        }
+      })
+      .catch(() => {
+        setEspScore(null);
+        setTestDetails(null);
+      })
+      .finally(() => {
+        setLoadingScore(false);
+      });
+  }, [donation._id]);
+
+  useEffect(() => {
+    fetchTestScore();
+  }, [fetchTestScore]);
+
+  const handleStartTest = async () => {
+    setActionLoading(true);
+    try {
+      await startEspTest(donation._id, 'ESP32-001');
+      toast.success('ESP32-001 food test started! ESP32 can now send readings.');
+      fetchTestScore();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Could not start ESP32 food test');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleCompleteActiveTest = async () => {
+    if (!testDetails?.testId) return;
+    setActionLoading(true);
+    try {
+      const res = await completeEspTest(testDetails.testId);
+      const score = res.data?.data?.foodQualityScore;
+      toast.success(score != null ? `Food test completed! Score: ${score}%` : 'Food test completed!');
+      fetchTestScore();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Could not complete food test');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const isSafeAllowed = espScore !== null && espScore >= 50;
+  const isUnsafeAllowed = espScore !== null && espScore < 50;
 
   const handleReview = async (isSafe) => {
     setSubmitting(isSafe ? 'safe' : 'spoiled');
@@ -240,7 +307,7 @@ const FoodSafetyReviewCard = ({ donation, onReviewSubmitted }) => {
         </div>
       </div>
 
-      {/* Donation info */}
+      {/* Donation info & ESP32 Health Score */}
       <div className="px-5 pt-4 pb-2">
         <p className="text-sm font-semibold text-gray-800 dark:text-gray-100">
           🍱 {donation.foodName}
@@ -250,29 +317,93 @@ const FoodSafetyReviewCard = ({ donation, onReviewSubmitted }) => {
             <FiMapPin size={11} /> {donation.pickupLocation.address}
           </p>
         )}
+
+        {/* ESP32 Food Health Score Display */}
+        {loadingScore ? (
+          <div className="mt-3 rounded-xl bg-white/80 p-3 dark:bg-gray-800/80 border border-amber-200 dark:border-amber-800 text-xs text-gray-500 animate-pulse">
+            Loading ESP32 Food Health Score…
+          </div>
+        ) : espScore !== null ? (
+          <div className="mt-3 rounded-xl bg-white/80 p-3 dark:bg-gray-800/80 border border-amber-200 dark:border-amber-800">
+            <div className="flex items-center justify-between text-sm font-bold text-gray-800 dark:text-gray-100">
+              <span>
+                Food Health Score: <strong className={espScore >= 50 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>{espScore}%</strong>
+              </span>
+              <span className={`text-xs px-2.5 py-0.5 rounded-full font-bold ${
+                espScore >= 50
+                  ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                  : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300'
+              }`}>
+                Status: {espScore >= 50 ? 'SAFE' : 'UNSAFE'}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-xl bg-white/80 p-3 dark:bg-gray-800/80 border border-amber-200 dark:border-amber-800 flex flex-col gap-2">
+            <div className="flex items-center justify-between text-sm font-semibold text-gray-600 dark:text-gray-400">
+              <span>
+                Food Health Score: <span className="font-bold text-amber-600 dark:text-amber-400">Not available</span>
+              </span>
+              <button
+                onClick={fetchTestScore}
+                className="text-xs text-amber-700 dark:text-amber-300 font-bold underline"
+              >
+                🔄 Refresh
+              </button>
+            </div>
+            {testDetails?.status === 'active' ? (
+              <button
+                onClick={handleCompleteActiveTest}
+                disabled={actionLoading}
+                className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-bold text-white shadow hover:bg-amber-700 transition disabled:opacity-50"
+              >
+                {actionLoading ? 'Calculating…' : '⚡ Complete ESP32 Test (ESP32-001) & Calculate Score'}
+              </button>
+            ) : (
+              <button
+                onClick={handleStartTest}
+                disabled={actionLoading}
+                className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow hover:bg-blue-700 transition disabled:opacity-50"
+              >
+                {actionLoading ? 'Starting…' : '▶ Start ESP32 Test (ESP32-001)'}
+              </button>
+            )}
+          </div>
+        )}
+
         <p className="mt-3 text-sm text-gray-700 dark:text-gray-300">
           Please inspect the food carefully before picking it up. Your review will be sent to the NGO.
         </p>
       </div>
 
-      {/* Confirmation step */}
+      {/* Confirmation step / Buttons */}
       {confirmed === null ? (
         <div className="flex gap-3 px-5 py-4">
           <button
             onClick={() => setConfirmed('safe')}
-            disabled={!!submitting}
-            className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-emerald-600 py-3 text-sm font-bold text-white shadow transition hover:bg-emerald-700 disabled:opacity-60"
+            disabled={!isSafeAllowed || !!submitting}
+            title={!isSafeAllowed ? (espScore === null ? 'ESP32 Food Health Score not available' : `Disabled: ESP32 Health Score is ${espScore}% (< 50% UNSAFE)`) : ''}
+            className={`flex-1 flex items-center justify-center gap-2 rounded-xl py-3 text-sm font-bold shadow transition ${
+              isSafeAllowed
+                ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                : 'bg-emerald-600 text-white opacity-40 grayscale blur-[0.5px] cursor-not-allowed pointer-events-none'
+            }`}
           >
             <FiThumbsUp size={16} />
-            Food is Safe &amp; OK
+            SAFE
           </button>
           <button
             onClick={() => setConfirmed('spoiled')}
-            disabled={!!submitting}
-            className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-red-600 py-3 text-sm font-bold text-white shadow transition hover:bg-red-700 disabled:opacity-60"
+            disabled={!isUnsafeAllowed || !!submitting}
+            title={!isUnsafeAllowed ? (espScore === null ? 'ESP32 Food Health Score not available' : `Disabled: ESP32 Health Score is ${espScore}% (>= 50% SAFE)`) : ''}
+            className={`flex-1 flex items-center justify-center gap-2 rounded-xl py-3 text-sm font-bold shadow transition ${
+              isUnsafeAllowed
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-red-600 text-white opacity-40 grayscale blur-[0.5px] cursor-not-allowed pointer-events-none'
+            }`}
           >
             <FiThumbsDown size={16} />
-            Food is Spoiled
+            UNSAFE
           </button>
         </div>
       ) : (
@@ -284,8 +415,8 @@ const FoodSafetyReviewCard = ({ donation, onReviewSubmitted }) => {
               : 'border-red-300 bg-red-50 text-red-800 dark:border-red-700 dark:bg-red-900/30 dark:text-red-200'
           }`}>
             {confirmed === 'safe'
-              ? '✅ You are confirming the food is safe. The NGO will be notified and you will start delivery.'
-              : '❌ You are confirming the food is spoiled. The NGO will be notified and the pickup will be cancelled.'}
+              ? `✅ You are confirming the food is SAFE (ESP32 Health Score: ${espScore}%). The NGO will be notified and you will start delivery.`
+              : `❌ You are confirming the food is UNSAFE (ESP32 Health Score: ${espScore}%). The NGO will be notified and the pickup will be cancelled.`}
           </div>
           <div className="flex gap-3">
             <button

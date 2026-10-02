@@ -97,6 +97,11 @@ const donationSchema = new mongoose.Schema(
       },
     ],
     deliveredAt: { type: Date },
+    foodSafetyReview: {
+      review: { type: String, enum: ['SAFE', 'UNSAFE', null], default: null },
+      healthScore: { type: Number, default: null },
+      reviewedAt: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );

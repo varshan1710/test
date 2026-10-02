@@ -308,17 +308,38 @@ const getLatestTestForDonation = asyncHandler(async (req, res) => {
     throw new Error('Donation not found');
   }
 
-  const foodTest = await FoodTest.findOne(
+  // 1. Check for a completed test
+  let foodTest = await FoodTest.findOne(
     { donationId: req.params.donationId, status: 'completed' },
     null,
     { sort: { completedAt: -1 } }
   );
 
-  if (!foodTest) {
-    return res.json({ success: true, data: null, message: 'No completed food test found for this donation' });
+  if (foodTest) {
+    return res.json({ success: true, data: foodTest });
   }
 
-  res.json({ success: true, data: foodTest });
+  // 2. Check for an active test with readings and auto-complete if readings exist
+  const activeTest = await FoodTest.findOne(
+    { donationId: req.params.donationId, status: 'active' },
+    null,
+    { sort: { startedAt: -1 } }
+  );
+
+  if (activeTest) {
+    if (activeTest.readings && activeTest.readings.length > 0) {
+      const scoreResult = calculateFoodQualityScore(activeTest.readings);
+      activeTest.status = 'completed';
+      activeTest.completedAt = new Date();
+      activeTest.foodQualityScore = scoreResult ? scoreResult.foodQualityScore : null;
+      await activeTest.save();
+      console.log(`[esp] Auto-completed test ${activeTest.testId} for donation ${req.params.donationId} — Score: ${activeTest.foodQualityScore}%`);
+      return res.json({ success: true, data: activeTest });
+    }
+    return res.json({ success: true, data: activeTest, message: 'Active ESP32 test in progress, awaiting readings' });
+  }
+
+  res.json({ success: true, data: null, message: 'No completed food test found for this donation' });
 });
 
 // ---------------------------------------------------------------------------

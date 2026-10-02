@@ -38,3 +38,13 @@ export const respondVolunteerInvitation = (id, accept) => api.put(`/donations/${
 export const completeVolunteerDelivery = (id) => api.put(`/donations/${id}/volunteer-complete`);
 
 export const confirmNgoDelivery = (id) => api.put(`/donations/${id}/ngo-confirm-delivery`);
+
+export const getLatestEspTestForDonation = (donationId) => api.get(`/esp/tests/donation/${donationId}/latest`);
+
+export const startEspTest = (donationId, deviceId = 'ESP32-001') =>
+  api.post('/esp/tests/start', { donationId, deviceId });
+
+export const completeEspTest = (testId) =>
+  api.post(`/esp/tests/${testId}/complete`);
+
+
